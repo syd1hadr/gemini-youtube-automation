@@ -1,52 +1,42 @@
 import os
-import json
-import google.generativeai as genai
+import time
+from google import genai
 
 def generate_curriculum():
-    # Sanitize API key
-    google_api_key = os.environ.get("GOOGLE_API_KEY", "")
-    google_api_key = (
-        google_api_key
-        .replace("\u2028", "")
-        .replace("\u2029", "")
-        .replace("\r", "")
-        .replace("\n", "")
-        .strip()
-    )
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is missing!")
     
-    if not google_api_key:
-        raise ValueError("GOOGLE_API_KEY is missing or empty")
+    client = genai.Client(api_key=api_key)
     
-    # Configure Gemini
-    genai.configure(api_key=google_api_key)
-    
-    prompt = """Generate a simple curriculum for an AI course. 
+    prompt = """Generate a simple curriculum for an AI course.
     Include 5 lessons with titles and brief descriptions.
-    Format: Return a JSON array with each lesson having 'title' and 'description' keys.
+    Return as JSON array with 'title' and 'description' keys.
     Keep it simple and educational."""
     
-    model = genai.GenerativeModel('gemini-2.0-flash')
-    response = model.generate_content(prompt)
-    
-    return response.text
+    for attempt in range(5):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str:
+                wait = (attempt + 1) * 2
+                print(f"⚠️ Quota exceeded. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise e
+    raise Exception("Max retries exceeded.")
 
 def generate_lesson_content(title):
-    # Sanitize API key
-    google_api_key = os.environ.get("GOOGLE_API_KEY", "")
-    google_api_key = (
-        google_api_key
-        .replace("\u2028", "")
-        .replace("\u2029", "")
-        .replace("\r", "")
-        .replace("\n", "")
-        .strip()
-    )
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is missing!")
     
-    if not google_api_key:
-        raise ValueError("GOOGLE_API_KEY is missing or empty")
-    
-    # Configure Gemini
-    genai.configure(api_key=google_api_key)
+    client = genai.Client(api_key=api_key)
     
     prompt = f"""Write a detailed lesson about: {title}
     
@@ -62,7 +52,19 @@ def generate_lesson_content(title):
     prompt = prompt.replace("\u2028", " ")
     prompt = prompt.replace("\u2029", " ")
     
-    model = genai.GenerativeModel('gemini-2.0-flash')
-    response = model.generate_content(prompt)
-    
-    return response.text
+    for attempt in range(5):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
+            return response.text
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str:
+                wait = (attempt + 1) * 2
+                print(f"⚠️ Quota exceeded. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise e
+    raise Exception("Max retries exceeded.")
