@@ -43,9 +43,7 @@ jobs:
         run: |
           echo '${{ secrets.CLIENT_SECRET_B64 }}' > client_secrets.json
            echo '${{ secrets.CREDENTIALS_B64 }}' > credentials.json
-               shell: bash
-    
-
+        
       - name: 🚀 Run Autonomous Production Pipeline
         id: production-run
         env:
