@@ -1,46 +1,23 @@
-name: Autonomous AI Course Generator
-
-on:
-  schedule:
-    - cron: '0 7 * * *'
-  workflow_dispatch:
-
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick ffmpeg
-          pip install -r requirements.txt
-
-      - name: Restore API credentials
-        run: |
-          echo '${{ secrets.CLIENT_SECRET_B64 }}' > client_secrets.json
-          echo '${{ secrets.CREDENTIALS_B64 }}' > credentials.json
-
-      - name: Run Autonomous Production Pipeline
+- name: Restore YouTube credentials
+        shell: bash
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        run: python main.py
+          CLIENT_SECRET_B64: ${{ secrets.CLIENT_SECRET_B64 }}
+          CREDENTIALS_B64: ${{ secrets.CREDENTIALS_B64 }}
+        run: |
+          set -euo pipefail
 
-      - name: Upload Final Video for Debugging
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-debug-files
-          path: output/*.mp4
+          test -n "$CLIENT_SECRET_B64" || {
+            echo "CLIENT_SECRET_B64 is missing"
+            exit 1
+          }
+
+          test -n "$CREDENTIALS_B64" || {
+            echo "CREDENTIALS_B64 is missing"
+            exit 1
+          }
+
+          printf '%s' "$CLIENT_SECRET_B64" | base64 --decode > client_secrets.json
+          printf '%s' "$CREDENTIALS_B64" | base64 --decode > credentials.json
+
+          python -m json.tool client_secrets.json > /dev/null
+          python -m json.tool credentials.json > /dev/null
