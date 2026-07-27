@@ -22,8 +22,7 @@ def generate_curriculum():
             )
             return response.text
         except Exception as e:
-            error_str = str(e)
-            if "429" in error_str:
+            if "429" in str(e):
                 wait = (attempt + 1) * 2
                 print(f"⚠️ Quota exceeded. Retrying in {wait}s...")
                 time.sleep(wait)
@@ -48,7 +47,6 @@ def generate_lesson_content(title):
     
     Keep it simple and educational."""
     
-    # Remove hidden Unicode characters
     prompt = prompt.replace("\u2028", " ")
     prompt = prompt.replace("\u2029", " ")
     
@@ -60,8 +58,7 @@ def generate_lesson_content(title):
             )
             return response.text
         except Exception as e:
-            error_str = str(e)
-            if "429" in error_str:
+            if "429" in str(e):
                 wait = (attempt + 1) * 2
                 print(f"⚠️ Quota exceeded. Retrying in {wait}s...")
                 time.sleep(wait)
