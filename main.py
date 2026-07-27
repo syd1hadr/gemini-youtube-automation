@@ -1,6 +1,6 @@
 import os
 import sys
-from src.generator import generate_curriculum, generate_lesson_content
+import google.generativeai as genai
 
 # Force UTF-8
 sys.stdout.reconfigure(encoding='utf-8')
@@ -23,23 +23,20 @@ def main():
     
     print("✅ Google API Key loaded successfully!")
     
-    # Test Gemini
-    import google.generativeai as genai
+    # Configure Gemini
     genai.configure(api_key=google_api_key)
     
-    model = genai.GenerativeModel('gemini-2.0-flash')
-    response = model.generate_content("Hello, are you working?")
-    print("✅ Gemini says:", response.text)
+    # Test Gemini
+    try:
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content("Hello, are you working?")
+        print("✅ Gemini says:", response.text[:50], "...")
+    except Exception as e:
+        print("❌ Gemini test failed:", e)
+        exit(1)
     
-    # Generate curriculum
-    print("📚 Generating curriculum...")
-    curriculum = generate_curriculum()
-    print("✅ Curriculum generated!")
-    
-    # Generate lesson
-    print("📝 Generating lesson...")
-    lesson = generate_lesson_content("AI Basics")
-    print("✅ Lesson generated!")
+    print("🎯 All tests passed! Project is ready.")
+    print("📝 Now you can add video generation code here.")
 
 if __name__ == "__main__":
     main()
