@@ -1,46 +1,10 @@
-name: Autonomous AI Course Generator
+import os
+import google.generativeai as genai
 
-on:
-  schedule:
-    - cron: '0 7 * * *'
-  workflow_dispatch:
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+print("✅ Gemini API configured successfully!")
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick ffmpeg
-          pip install -r requirements.txt
-
-      - name: Restore API credentials
-        run: |
-          echo '${{ secrets.CLIENT_SECRET_B64 }}' > client_secrets.json
-          echo '${{ secrets.CREDENTIALS_B64 }}' > credentials.json
-
-      - name: Run Autonomous Production Pipeline
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        run: python main.py
-
-      - name: Upload Final Video for Debugging
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: video-debug-files
-          path: output/*.mp4
+model = genai.GenerativeModel('gemini-2.0-flash')
+response = model.generate_content("Hello, are you working?")
+print("✅ Gemini Response:", response.text)
