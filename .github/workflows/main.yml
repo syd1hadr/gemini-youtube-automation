@@ -2,7 +2,7 @@ name: Autonomous AI Course Generator
 
 on:
   schedule:
-    - cron: '0 7 * * *' # 12:30 PM IST daily
+    - cron: '0 7 * * *'
   workflow_dispatch:
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies and patch ImageMagick
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick ffmpeg
@@ -33,18 +33,10 @@ jobs:
           echo '${{ secrets.CREDENTIALS_B64 }}' > credentials.json
 
       - name: Run Autonomous Production Pipeline
-        id: production-run
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: python main.py
-
-      - name: Upload Audio Artifact for Debugging
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: audio-debug-files
-          path: output/*.wav
 
       - name: Upload Final Video for Debugging
         if: always()
@@ -52,18 +44,3 @@ jobs:
         with:
           name: video-debug-files
           path: output/*.mp4
-
-      - name: Generate demo GIF from latest video
-        if: always()
-        run: |
-          mkdir -p output
-          ffmpeg -i output/*.mp4 -vf "fps=10,scale=320:-1" output/demo.gif || true
-
-      - name: Commit and push content plan and demo GIF
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add content_plan.json output/demo.gif || true
-          git commit -m "feat: Update content plan and demo GIF after daily video production" || echo "No changes to commit"
-          git push
