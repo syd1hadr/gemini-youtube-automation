@@ -17,7 +17,7 @@ def generate_curriculum():
     for attempt in range(5):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-1.5-flash',
                 contents=prompt
             )
             return response.text
@@ -55,7 +55,7 @@ def generate_lesson_content(title):
     for attempt in range(5):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-1.5-flash',
                 contents=prompt
             )
             return response.text
