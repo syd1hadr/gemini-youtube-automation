@@ -1,15 +1,36 @@
-# Gemini SDK patch for src/generator.py
-# Copy the imports and functions below into src/generator.py.
-# Keep your existing Pexels, TTS, video, thumbnail, and YouTube code unchanged.
+# FILE: src/generator.py
+"""Gemini content generation, TTS, visuals, and video rendering."""
+
+from __future__ import annotations
 
 import json
 import os
 import time
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
+import requests
 from google import genai
 from google.genai import types
+from gtts import gTTS
+from moviepy.config import change_settings
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeAudioClip,
+    ImageClip,
+    concatenate_videoclips,
+    vfx,
+)
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from pydub import AudioSegment
 
+
+ASSETS_PATH = Path("assets")
+FONT_FILE = ASSETS_PATH / "fonts/arial.ttf"
+BACKGROUND_MUSIC_PATH = ASSETS_PATH / "music/bg_music.mp3"
+FALLBACK_THUMBNAIL_FONT = ImageFont.load_default()
+YOUR_NAME = os.getenv("CHANNEL_NAME", "Chaitanya")
 
 MODEL_CANDIDATES = [
     "gemini-3.5-flash",
@@ -20,259 +41,526 @@ MODEL_CANDIDATES = [
 _CLIENT: genai.Client | None = None
 _MODEL_NAME: str | None = None
 
+if os.name == "posix":
+    change_settings({"IMAGEMAGICK_BINARY": "/usr/bin/convert"})
+
 
 def _clean_text(value: str) -> str:
-    """Remove hidden characters that previously caused header/encoding errors."""
     return (
-        value.replace("\u2028", " ")
+        str(value)
+        .replace("\u2028", " ")
         .replace("\u2029", " ")
         .replace("\r", " ")
         .strip()
     )
 
 
-def _available_generate_models(client: genai.Client) -> list[str]:
-    """Return model names available to this API key."""
-    names: list[str] = []
-
-    for model in client.models.list():
-        name = str(getattr(model, "name", "") or "").replace("models/", "")
-        if not name:
-            continue
-
-        actions = getattr(model, "supported_actions", None)
-        if actions and "generateContent" not in actions:
-            continue
-
-        names.append(name)
-
-    print(f"Available Gemini models: {names}")
-    return names
-
-
-def _choose_model(client: genai.Client) -> str:
-    """Choose a usable text model without repeatedly retrying an unavailable model."""
-    available = _available_generate_models(client)
-
-    for candidate in MODEL_CANDIDATES:
-        if candidate in available:
-            print(f"Selected Gemini model: {candidate}")
-            return candidate
-
-    # Safe fallback: choose an available Flash text model.
-    blocked_words = ("image", "tts", "audio", "embedding", "robotics", "computer-use")
-    for name in available:
-        lower_name = name.lower()
-        if "flash" in lower_name and not any(word in lower_name for word in blocked_words):
-            print(f"Selected fallback Gemini model: {name}")
-            return name
-
-    raise RuntimeError(
-        "No usable Gemini text model is available for this API key. "
-        f"Available models: {available}"
-    )
-
-
-def get_client_and_model() -> tuple[genai.Client, str]:
-    """Create the Gemini client and select the model once per workflow run."""
-    global _CLIENT, _MODEL_NAME
-
+def _get_client() -> genai.Client:
+    global _CLIENT
     if _CLIENT is None:
         api_key = _clean_text(os.environ.get("GOOGLE_API_KEY", ""))
         if not api_key:
             raise ValueError("GOOGLE_API_KEY is missing or empty.")
         _CLIENT = genai.Client(api_key=api_key)
+    return _CLIENT
 
-    if _MODEL_NAME is None:
-        _MODEL_NAME = _choose_model(_CLIENT)
 
-    return _CLIENT, _MODEL_NAME
+def _list_model_names(client: genai.Client) -> list[str]:
+    names: list[str] = []
+    for model in client.models.list():
+        name = str(getattr(model, "name", "") or "").replace("models/", "")
+        if name:
+            names.append(name)
+    print(f"â Available Gemini models: {names}")
+    return names
+
+
+def _choose_model(client: genai.Client) -> str:
+    global _MODEL_NAME
+    if _MODEL_NAME:
+        return _MODEL_NAME
+
+    available = _list_model_names(client)
+
+    for candidate in MODEL_CANDIDATES:
+        if candidate in available:
+            _MODEL_NAME = candidate
+            print(f"ð¯ Selected Gemini model: {_MODEL_NAME}")
+            return _MODEL_NAME
+
+    blocked = (
+        "image",
+        "tts",
+        "audio",
+        "embedding",
+        "robotics",
+        "computer-use",
+        "lyria",
+        "deep-research",
+    )
+    for name in available:
+        lower = name.lower()
+        if "flash" in lower and not any(word in lower for word in blocked):
+            _MODEL_NAME = name
+            print(f"ð¯ Selected fallback Gemini model: {_MODEL_NAME}")
+            return _MODEL_NAME
+
+    raise RuntimeError(
+        "No usable Gemini text model is available. "
+        f"Available models: {available}"
+    )
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    cleaned = (text or "").strip()
+    cleaned = cleaned.removeprefix("```json").removeprefix("```")
+    cleaned = cleaned.removesuffix("```").strip()
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("Gemini response must be a JSON object.")
+    return parsed
 
 
 def _generate_json(prompt: str, retries: int = 2) -> dict[str, Any]:
-    """Generate and parse a JSON object. Retry only temporary 429/503 errors."""
-    client, model_name = get_client_and_model()
-    clean_prompt = _clean_text(prompt)
+    client = _get_client()
+    model_name = _choose_model(client)
+    prompt = _clean_text(prompt)
 
     for attempt in range(retries + 1):
         try:
             response = client.models.generate_content(
                 model=model_name,
-                contents=clean_prompt,
+                contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.7,
                 ),
             )
-
-            text = (response.text or "").strip()
-            if not text:
+            if not response.text:
                 raise ValueError("Gemini returned an empty response.")
-
-            # Extra protection if a model still adds Markdown fences.
-            text = text.removeprefix("```json").removeprefix("```")
-            text = text.removesuffix("```").strip()
-
-            result = json.loads(text)
-            if not isinstance(result, dict):
-                raise ValueError("Gemini response must be a JSON object.")
-
-            return result
-
+            return _extract_json(response.text)
         except Exception as exc:
             message = str(exc)
-
-            # Never retry an unavailable-model 404 with the same model.
             if "404" in message or "NOT_FOUND" in message:
                 raise RuntimeError(
-                    f"Selected model '{model_name}' became unavailable: {exc}"
+                    f"Selected Gemini model '{model_name}' is unavailable: {exc}"
                 ) from exc
 
             temporary = "429" in message or "503" in message
             if temporary and attempt < retries:
-                wait_seconds = 5 * (2 ** attempt)
-                print(f"Temporary Gemini error. Retrying in {wait_seconds}s: {exc}")
-                time.sleep(wait_seconds)
+                wait = 5 * (2**attempt)
+                print(f"â ï¸ Temporary Gemini error. Retrying in {wait}s: {exc}")
+                time.sleep(wait)
                 continue
-
             raise
 
 
-def generate_curriculum(previous_titles: list[str] | None = None) -> dict[str, Any]:
-    """Return the exact curriculum structure expected by main.py."""
+def get_pexels_image(query: str, video_type: str) -> Image.Image | None:
+    """Fetch one relevant background image from Pexels."""
+    pexels_api_key = _clean_text(os.getenv("PEXELS_API_KEY", ""))
+    if not pexels_api_key:
+        print("â ï¸ PEXELS_API_KEY missing. Using a solid background.")
+        return None
+
+    orientation = "landscape" if video_type == "long" else "portrait"
+    try:
+        response = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers={"Authorization": pexels_api_key},
+            params={
+                "query": f"abstract {query}",
+                "per_page": 1,
+                "orientation": orientation,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        photos = response.json().get("photos", [])
+        if not photos:
+            return None
+
+        image_url = photos[0]["src"]["large2x"]
+        image_response = requests.get(image_url, timeout=20)
+        image_response.raise_for_status()
+        return Image.open(BytesIO(image_response.content)).convert("RGBA")
+    except Exception as exc:
+        print(f"â ï¸ Pexels image unavailable for '{query}': {exc}")
+        return None
+
+
+def text_to_speech(text: str, output_path: Path) -> Path:
+    """Convert narration to WAV for reliable MoviePy audio."""
+    print("ð¤ Converting script to speech...")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_mp3 = output_path.with_name(f"{output_path.stem}_temp.mp3")
+    wav_path = output_path.with_suffix(".wav")
+
+    try:
+        gTTS(text=_clean_text(text), lang="en", slow=False).save(str(temp_mp3))
+        audio = AudioSegment.from_mp3(str(temp_mp3))
+        audio.export(str(wav_path), format="wav", codec="pcm_s16le")
+        temp_mp3.unlink(missing_ok=True)
+        print("â Speech generated successfully.")
+        return wav_path
+    except Exception:
+        temp_mp3.unlink(missing_ok=True)
+        raise
+
+
+def generate_curriculum(
+    previous_titles: list[str] | None = None,
+) -> dict[str, Any]:
+    """Generate the exact curriculum structure expected by main.py."""
+    print("ð¤ Generating curriculum...")
+
     history = ""
     if previous_titles:
         formatted = "\n".join(
-            f"{index + 1}. {title}" for index, title in enumerate(previous_titles)
+            f"{index + 1}. {title}"
+            for index, title in enumerate(previous_titles)
         )
         history = (
-            "\nThese lessons have already been created. Do not repeat them:\n"
+            "These lessons have already been created. Do not repeat them:\n"
             f"{formatted}\nContinue from where the series stopped.\n"
         )
 
     prompt = f"""
-You are an expert AI educator creating a YouTube course named
-"AI for Developers".
+You are an expert AI educator creating a beginner-friendly YouTube course
+called "AI for Developers by {YOUR_NAME}".
 
-The viewer is a complete beginner. Use simple language, practical examples,
-and a logical progression from beginner to advanced topics.
 {history}
 
-Return ONLY one valid JSON object in exactly this structure:
-
+Return ONLY one valid JSON object with exactly this structure:
 {{
   "lessons": [
     {{
-      "chapter": "Chapter 1",
-      "part": "Part 1",
-      "title": "Clear lesson title",
+      "chapter": "1",
+      "part": "1",
+      "title": "A clear lesson title",
       "status": "pending",
-      "youtube_id": ""
+      "youtube_id": null
     }}
   ]
 }}
 
 Rules:
-- Create 20 lessons.
-- Every lesson must contain chapter, part, title, status and youtube_id.
-- status must always be "pending".
-- youtube_id must always be an empty string.
-- Do not include Markdown or explanatory text outside the JSON.
+- Create exactly 20 lessons.
+- Progress logically from beginner to advanced AI.
+- Every lesson must contain chapter, part, title, status, and youtube_id.
+- status must be "pending".
+- youtube_id must be null.
+- Do not include Markdown or explanations outside JSON.
 """
-
     result = _generate_json(prompt)
-
     lessons = result.get("lessons")
     if not isinstance(lessons, list) or not lessons:
-        raise ValueError("Curriculum JSON is missing a non-empty 'lessons' list.")
+        raise ValueError("Gemini returned no valid 'lessons' list.")
 
-    cleaned_lessons: list[dict[str, str]] = []
+    clean_lessons: list[dict[str, Any]] = []
     for index, lesson in enumerate(lessons, start=1):
         if not isinstance(lesson, dict):
             continue
-
-        title = str(lesson.get("title", "")).strip()
+        title = _clean_text(lesson.get("title", ""))
         if not title:
             continue
-
-        cleaned_lessons.append(
+        clean_lessons.append(
             {
-                "chapter": str(lesson.get("chapter") or f"Chapter {index}").strip(),
-                "part": str(lesson.get("part") or f"Part {index}").strip(),
+                "chapter": _clean_text(lesson.get("chapter", index)),
+                "part": _clean_text(lesson.get("part", index)),
                 "title": title,
                 "status": "pending",
-                "youtube_id": "",
+                "youtube_id": None,
             }
         )
 
-    if not cleaned_lessons:
-        raise ValueError("Gemini returned no valid curriculum lessons.")
-
-    return {"lessons": cleaned_lessons}
+    if not clean_lessons:
+        raise ValueError("Gemini returned no usable lessons.")
+    return {"lessons": clean_lessons}
 
 
 def generate_lesson_content(lesson_title: str) -> dict[str, Any]:
-    """Return the exact lesson structure expected by main.py."""
-    safe_title = _clean_text(str(lesson_title))
+    """Generate long-form slides, a Short highlight, and hashtags."""
+    lesson_title = _clean_text(lesson_title)
+    print(f"ð¤ Generating content for lesson: '{lesson_title}'...")
 
     prompt = f"""
-Create one beginner-friendly YouTube lesson about:
+Create a beginner-friendly YouTube lesson for
+"AI for Developers by {YOUR_NAME}".
 
-{safe_title}
+Topic: {lesson_title}
 
-Return ONLY one valid JSON object in exactly this structure:
-
+Return ONLY one valid JSON object with exactly this structure:
 {{
   "long_form_slides": [
     {{
       "title": "Slide title",
-      "content": "Clear slide explanation"
+      "content": "Simple and useful slide explanation"
     }}
   ],
-  "short_form_highlight": "A punchy 1-2 sentence summary for a YouTube Short.",
+  "short_form_highlight": "A punchy 1-2 sentence summary.",
   "hashtags": "#AI #Developer #LearnAI"
 }}
 
 Rules:
 - Create 7 to 8 long_form_slides.
-- Each slide must contain both title and content.
-- Explain concepts simply with examples and analogies.
-- short_form_highlight must be concise and understandable by itself.
-- hashtags must contain 5 to 7 relevant, space-separated hashtags.
-- Do not include Markdown or explanatory text outside the JSON.
+- Each slide must contain title and content.
+- Use simple explanations, examples, and analogies.
+- The highlight must work as a standalone YouTube Short.
+- Include 5 to 7 relevant space-separated hashtags.
+- Do not include Markdown or explanations outside JSON.
 """
-
     result = _generate_json(prompt)
 
     slides = result.get("long_form_slides")
     if not isinstance(slides, list) or not slides:
-        raise ValueError(
-            "Lesson JSON is missing a non-empty 'long_form_slides' list."
-        )
+        raise ValueError("Gemini returned no valid long_form_slides.")
 
-    cleaned_slides: list[dict[str, str]] = []
+    clean_slides: list[dict[str, str]] = []
     for slide in slides:
         if not isinstance(slide, dict):
             continue
-
-        title = str(slide.get("title", "")).strip()
-        content = str(slide.get("content", "")).strip()
+        title = _clean_text(slide.get("title", ""))
+        content = _clean_text(slide.get("content", ""))
         if title and content:
-            cleaned_slides.append({"title": title, "content": content})
+            clean_slides.append({"title": title, "content": content})
 
-    if not cleaned_slides:
-        raise ValueError("Gemini returned no valid lesson slides.")
+    if not clean_slides:
+        raise ValueError("Gemini returned no usable slides.")
 
-    highlight = str(result.get("short_form_highlight", "")).strip()
-    hashtags = str(result.get("hashtags", "")).strip()
-
-    if not highlight:
-        highlight = f"Quick lesson: {safe_title}"
-    if not hashtags:
-        hashtags = "#AI #Developer #LearnAI #Programming #Technology"
+    highlight = _clean_text(result.get("short_form_highlight", ""))
+    hashtags = _clean_text(result.get("hashtags", ""))
 
     return {
-        "long_form_slides": cleaned_slides,
-        "short_form_highlight": highlight,
-        "hashtags": hashtags,
-        }
+        "long_form_slides": clean_slides,
+        "short_form_highlight": highlight or f"Quick AI lesson: {lesson_title}",
+        "hashtags": hashtags
+        or "#AI #Developer #LearnAI #Programming #Technology",
+    }
+
+
+def _font(size: int) -> ImageFont.ImageFont:
+    try:
+        return ImageFont.truetype(str(FONT_FILE), size)
+    except OSError:
+        return FALLBACK_THUMBNAIL_FONT
+
+
+def _wrap_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    words = str(text).split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip()
+        box = draw.textbbox((0, 0), test, font=font)
+        if box[2] - box[0] <= max_width or not current:
+            current = test
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def generate_visuals(
+    output_dir: Path,
+    video_type: str,
+    slide_content: dict[str, str] | None = None,
+    thumbnail_title: str | None = None,
+    slide_number: int = 0,
+    total_slides: int = 0,
+) -> str:
+    """Create one slide or thumbnail."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    is_thumbnail = thumbnail_title is not None
+    width, height = (1920, 1080) if video_type == "long" else (1080, 1920)
+    slide_content = slide_content or {}
+    title = _clean_text(
+        thumbnail_title if is_thumbnail else slide_content.get("title", "")
+    )
+
+    bg_image = get_pexels_image(title, video_type)
+    if bg_image is None:
+        bg_image = Image.new("RGBA", (width, height), color=(12, 17, 29))
+
+    bg_image = bg_image.resize((width, height)).filter(
+        ImageFilter.GaussianBlur(5)
+    )
+    darken = Image.new("RGBA", bg_image.size, (0, 0, 0, 150))
+    final_bg = Image.alpha_composite(bg_image, darken).convert("RGB")
+    draw = ImageDraw.Draw(final_bg)
+
+    title_font = _font(80 if video_type == "long" else 90)
+    content_font = _font(45 if video_type == "long" else 55)
+    footer_font = _font(25 if video_type == "long" else 35)
+
+    if is_thumbnail:
+        title_lines = _wrap_text(draw, title, title_font, int(width * 0.85))
+        line_height = max(title_font.getbbox("Ag")[3] + 12, 30)
+        start_y = (height - len(title_lines) * line_height) / 2
+        for line in title_lines:
+            box = draw.textbbox((0, 0), line, font=title_font)
+            x = (width - (box[2] - box[0])) / 2
+            draw.text(
+                (x, start_y),
+                line,
+                font=title_font,
+                fill=(255, 255, 255),
+                stroke_width=2,
+                stroke_fill="black",
+            )
+            start_y += line_height
+    else:
+        header_height = int(height * 0.18)
+        draw.rectangle(
+            (0, 0, width, header_height),
+            fill=(25, 40, 65, 200),
+        )
+
+        title_lines = _wrap_text(draw, title, title_font, int(width * 0.9))
+        title_line_height = max(title_font.getbbox("Ag")[3] + 10, 30)
+        title_y = (
+            header_height - len(title_lines) * title_line_height
+        ) / 2
+        for line in title_lines:
+            box = draw.textbbox((0, 0), line, font=title_font)
+            x = (width - (box[2] - box[0])) / 2
+            draw.text(
+                (x, title_y),
+                line,
+                font=title_font,
+                fill=(255, 255, 255),
+            )
+            title_y += title_line_height
+
+        content = _clean_text(slide_content.get("content", ""))
+        content_lines = _wrap_text(
+            draw,
+            content,
+            content_font,
+            int(width * 0.82),
+        )
+        content_line_height = max(content_font.getbbox("Ag")[3] + 15, 25)
+        content_y = header_height + 100
+        if len(content.split()) < 10:
+            content_y = (
+                height - len(content_lines) * content_line_height
+            ) / 2
+
+        for line in content_lines:
+            box = draw.textbbox((0, 0), line, font=content_font)
+            x = (width - (box[2] - box[0])) / 2
+            draw.text(
+                (x, content_y),
+                line,
+                font=content_font,
+                fill=(230, 230, 230),
+            )
+            content_y += content_line_height
+
+        footer_height = int(height * 0.06)
+        draw.rectangle(
+            (0, height - footer_height, width, height),
+            fill=(25, 40, 65, 200),
+        )
+        draw.text(
+            (40, height - footer_height + 12),
+            f"AI for Developers by {YOUR_NAME}",
+            font=footer_font,
+            fill=(180, 180, 180),
+        )
+        if total_slides:
+            slide_text = f"Slide {slide_number} of {total_slides}"
+            box = draw.textbbox((0, 0), slide_text, font=footer_font)
+            draw.text(
+                (width - (box[2] - box[0]) - 40, height - footer_height + 12),
+                slide_text,
+                font=footer_font,
+                fill=(180, 180, 180),
+            )
+
+    prefix = "thumbnail" if is_thumbnail else f"slide_{slide_number:02d}"
+    path = output_dir / f"{prefix}.png"
+    final_bg.save(path)
+    return str(path)
+
+
+def create_video(
+    slide_paths: list[str],
+    audio_paths: list[Path],
+    output_path: Path,
+    video_type: str,
+) -> None:
+    """Create final video from slides and synchronized narration."""
+    print(f"ð¬ Creating {video_type} video...")
+    if not slide_paths or len(slide_paths) != len(audio_paths):
+        raise ValueError("Slides and audio counts do not match.")
+
+    image_clips = []
+    opened_audio = []
+    bg_music = None
+    final_video = None
+
+    try:
+        for image_path, audio_path in zip(slide_paths, audio_paths):
+            audio_clip = AudioFileClip(str(audio_path))
+            opened_audio.append(audio_clip)
+            duration = audio_clip.duration + 0.5
+            clip = (
+                ImageClip(str(image_path))
+                .set_duration(duration)
+                .set_audio(audio_clip)
+                .fadein(0.5)
+                .fadeout(0.5)
+            )
+            image_clips.append(clip)
+
+        final_video = concatenate_videoclips(image_clips, method="compose")
+
+        if BACKGROUND_MUSIC_PATH.exists():
+            print("ðµ Adding background music...")
+            bg_music = AudioFileClip(str(BACKGROUND_MUSIC_PATH)).volumex(0.05)
+            if bg_music.duration < final_video.duration:
+                bg_music = bg_music.fx(vfx.loop, duration=final_video.duration)
+            else:
+                bg_music = bg_music.subclip(0, final_video.duration)
+
+            final_video = final_video.set_audio(
+                CompositeAudioClip(
+                    [final_video.audio.volumex(1.2), bg_music]
+                )
+            )
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        final_video.write_videofile(
+            str(output_path),
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            audio_bitrate="192k",
+            preset="medium",
+            threads=4,
+        )
+        print(f"â {video_type.capitalize()} video created successfully!")
+    finally:
+        if final_video is not None:
+            final_video.close()
+        if bg_music is not None:
+            bg_music.close()
+        for clip in image_clips:
+            clip.close()
+        for audio in opened_audio:
+            audio.close()
