@@ -121,38 +121,120 @@ def _extract_json(text: str) -> dict[str, Any]:
     return parsed
 
 
-def _generate_json(prompt: str, retries: int = 2) -> dict[str, Any]:
+def _candidate_models(client: genai.Client) -> list[str]:
+    """Return preferred available text models in fallback order."""
+    available = _list_model_names(client)
+    ordered: list[str] = []
+
+    for candidate in MODEL_CANDIDATES:
+        if candidate in available and candidate not in ordered:
+            ordered.append(candidate)
+
+    blocked = (
+        "image",
+        "tts",
+        "audio",
+        "embedding",
+        "robotics",
+        "computer-use",
+        "lyria",
+        "deep-research",
+        "live",
+    )
+    for name in available:
+        lower = name.lower()
+        if (
+            "flash" in lower
+            and not any(word in lower for word in blocked)
+            and name not in ordered
+        ):
+            ordered.append(name)
+
+    if not ordered:
+        raise RuntimeError(
+            "No usable Gemini text model is available. "
+            f"Available models: {available}"
+        )
+
+    print(f"ð Gemini fallback order: {ordered}")
+    return ordered
+
+
+def _generate_json(prompt: str) -> dict[str, Any]:
+    """
+    Generate JSON with model fallback.
+
+    For each model:
+    - Try immediately.
+    - Retry temporary 429/503 errors after 10, 30, and 60 seconds.
+    - On persistent 429/503 or a 404, move to the next available model.
+    """
     client = _get_client()
-    model_name = _choose_model(client)
     prompt = _clean_text(prompt)
+    models = _candidate_models(client)
+    wait_times = (10, 30, 60)
+    errors: list[str] = []
 
-    for attempt in range(retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.7,
-                ),
-            )
-            if not response.text:
-                raise ValueError("Gemini returned an empty response.")
-            return _extract_json(response.text)
-        except Exception as exc:
-            message = str(exc)
-            if "404" in message or "NOT_FOUND" in message:
-                raise RuntimeError(
-                    f"Selected Gemini model '{model_name}' is unavailable: {exc}"
-                ) from exc
+    global _MODEL_NAME
 
-            temporary = "429" in message or "503" in message
-            if temporary and attempt < retries:
-                wait = 5 * (2**attempt)
-                print(f"â ï¸ Temporary Gemini error. Retrying in {wait}s: {exc}")
-                time.sleep(wait)
-                continue
-            raise
+    for model_name in models:
+        print(f"ð¯ Trying Gemini model: {model_name}")
+
+        for attempt in range(len(wait_times) + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.7,
+                    ),
+                )
+
+                if not response.text:
+                    raise ValueError("Gemini returned an empty response.")
+
+                result = _extract_json(response.text)
+                _MODEL_NAME = model_name
+                print(f"â Gemini request succeeded with: {model_name}")
+                return result
+
+            except Exception as exc:
+                message = str(exc)
+                is_not_found = "404" in message or "NOT_FOUND" in message
+                is_temporary = "429" in message or "503" in message
+
+                if is_not_found:
+                    print(
+                        f"â ï¸ Model unavailable: {model_name}. "
+                        "Trying the next model."
+                    )
+                    errors.append(f"{model_name}: {message}")
+                    break
+
+                if is_temporary:
+                    if attempt < len(wait_times):
+                        wait = wait_times[attempt]
+                        print(
+                            f"â ï¸ Temporary error on {model_name}. "
+                            f"Retrying in {wait}s: {exc}"
+                        )
+                        time.sleep(wait)
+                        continue
+
+                    print(
+                        f"â ï¸ {model_name} stayed unavailable after all retries. "
+                        "Trying the next model."
+                    )
+                    errors.append(f"{model_name}: {message}")
+                    break
+
+                raise
+
+    raise RuntimeError(
+        "All available Gemini models failed. Errors: "
+        + " | ".join(errors)
+    )
 
 
 def get_pexels_image(query: str, video_type: str) -> Image.Image | None:
