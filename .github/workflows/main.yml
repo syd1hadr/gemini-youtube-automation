@@ -39,8 +39,7 @@ jobs:
           pip install -r requirements.txt
           echo "✅ Dependencies installed."
 
-      - name: 🔑 Restore API credentials
-
+      - name: Restore API credentials
         run: |
           echo '${{ secrets.CLIENT_SECRET_B64 }}' > client_secrets.json
            echo '${{ secrets.CREDENTIALS_B64 }}' > credentials.json
