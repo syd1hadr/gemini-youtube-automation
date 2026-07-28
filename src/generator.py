@@ -25,7 +25,6 @@ from moviepy.editor import (
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pydub import AudioSegment
 
-
 ASSETS_PATH = Path("assets")
 FONT_FILE = ASSETS_PATH / "fonts/arial.ttf"
 BACKGROUND_MUSIC_PATH = ASSETS_PATH / "music/bg_music.mp3"
@@ -35,6 +34,8 @@ YOUR_NAME = os.getenv("CHANNEL_NAME", "Chaitanya")
 MODEL_CANDIDATES = [
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
 ]
 
@@ -45,7 +46,7 @@ if os.name == "posix":
     change_settings({"IMAGEMAGICK_BINARY": "/usr/bin/convert"})
 
 
-def _clean_text(value: str) -> str:
+def _clean_text(value: Any) -> str:
     return (
         str(value)
         .replace("\u2028", " ")
@@ -75,46 +76,14 @@ def _list_model_names(client: genai.Client) -> list[str]:
     return names
 
 
-def _choose_model(client: genai.Client) -> str:
-    global _MODEL_NAME
-    if _MODEL_NAME:
-        return _MODEL_NAME
-
-    available = _list_model_names(client)
-
-    for candidate in MODEL_CANDIDATES:
-        if candidate in available:
-            _MODEL_NAME = candidate
-            print(f"ð¯ Selected Gemini model: {_MODEL_NAME}")
-            return _MODEL_NAME
-
-    blocked = (
-        "image",
-        "tts",
-        "audio",
-        "embedding",
-        "robotics",
-        "computer-use",
-        "lyria",
-        "deep-research",
-    )
-    for name in available:
-        lower = name.lower()
-        if "flash" in lower and not any(word in lower for word in blocked):
-            _MODEL_NAME = name
-            print(f"ð¯ Selected fallback Gemini model: {_MODEL_NAME}")
-            return _MODEL_NAME
-
-    raise RuntimeError(
-        "No usable Gemini text model is available. "
-        f"Available models: {available}"
-    )
-
-
 def _extract_json(text: str) -> dict[str, Any]:
     cleaned = (text or "").strip()
-    cleaned = cleaned.removeprefix("```json").removeprefix("```")
-    cleaned = cleaned.removesuffix("```").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[len("```json"):].lstrip()
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[len("```"):].lstrip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].rstrip()
     parsed = json.loads(cleaned)
     if not isinstance(parsed, dict):
         raise ValueError("Gemini response must be a JSON object.")
@@ -122,24 +91,16 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 def _candidate_models(client: genai.Client) -> list[str]:
-    """Return preferred available text models in fallback order."""
     available = _list_model_names(client)
     ordered: list[str] = []
-
     for candidate in MODEL_CANDIDATES:
         if candidate in available and candidate not in ordered:
             ordered.append(candidate)
 
     blocked = (
-        "image",
-        "tts",
-        "audio",
-        "embedding",
-        "robotics",
-        "computer-use",
-        "lyria",
-        "deep-research",
-        "live",
+        "image", "tts", "audio", "embedding", "robotics",
+        "computer-use", "lyria", "deep-research", "live",
+        "vision", "imagen", "veo",
     )
     for name in available:
         lower = name.lower()
@@ -155,20 +116,33 @@ def _candidate_models(client: genai.Client) -> list[str]:
             "No usable Gemini text model is available. "
             f"Available models: {available}"
         )
-
     print(f"ð Gemini fallback order: {ordered}")
     return ordered
 
 
-def _generate_json(prompt: str) -> dict[str, Any]:
-    """
-    Generate JSON with model fallback.
+def _is_auth_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in (
+        "api key not valid", "invalid api key", "permission_denied",
+        "permission denied", "unauthenticated", "401", "403",
+    ))
 
-    For each model:
-    - Try immediately.
-    - Retry temporary 429/503 errors after 10, 30, and 60 seconds.
-    - On persistent 429/503 or a 404, move to the next available model.
-    """
+
+def _is_not_found_error(message: str) -> bool:
+    lower = message.lower()
+    return "404" in lower or "not_found" in lower or "not found" in lower
+
+
+def _is_temporary_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in (
+        "429", "503", "500", "resource_exhausted", "resource exhausted",
+        "unavailable", "deadline_exceeded", "deadline exceeded",
+        "timeout", "timed out",
+    ))
+
+
+def _generate_json(prompt: str) -> dict[str, Any]:
     client = _get_client()
     prompt = _clean_text(prompt)
     models = _candidate_models(client)
@@ -190,77 +164,66 @@ def _generate_json(prompt: str) -> dict[str, Any]:
                         temperature=0.7,
                     ),
                 )
-
-                if not response.text:
+                response_text = getattr(response, "text", None)
+                if not response_text:
                     raise ValueError("Gemini returned an empty response.")
-
-                result = _extract_json(response.text)
+                result = _extract_json(response_text)
                 _MODEL_NAME = model_name
                 print(f"â Gemini request succeeded with: {model_name}")
                 return result
 
             except Exception as exc:
-                message = str(exc)
-                is_not_found = "404" in message or "NOT_FOUND" in message
-                is_temporary = "429" in message or "503" in message
+                message = _clean_text(exc)
+                detail = f"{type(exc).__name__}: {message}"
 
-                if is_not_found:
+                if _is_auth_error(message):
+                    raise RuntimeError(
+                        "Gemini authentication/permission failed. "
+                        "Check GOOGLE_API_KEY and Gemini API access. "
+                        f"Original error: {detail}"
+                    ) from exc
+
+                if _is_temporary_error(message) and attempt < len(wait_times):
+                    wait = wait_times[attempt]
                     print(
-                        f"â ï¸ Model unavailable: {model_name}. "
-                        "Trying the next model."
+                        f"â ï¸ Temporary error on {model_name}. "
+                        f"Retrying in {wait}s. Error: {detail}"
                     )
-                    errors.append(f"{model_name}: {message}")
-                    break
+                    time.sleep(wait)
+                    continue
 
-                if is_temporary:
-                    if attempt < len(wait_times):
-                        wait = wait_times[attempt]
-                        print(
-                            f"â ï¸ Temporary error on {model_name}. "
-                            f"Retrying in {wait}s: {exc}"
-                        )
-                        time.sleep(wait)
-                        continue
+                if _is_not_found_error(message):
+                    print(f"â ï¸ Model unavailable: {model_name}. Trying next model.")
+                elif _is_temporary_error(message):
+                    print(f"â ï¸ {model_name} failed after retries. Trying next model.")
+                else:
+                    print(f"â ï¸ {model_name} failed: {detail}. Trying next model.")
 
-                    print(
-                        f"â ï¸ {model_name} stayed unavailable after all retries. "
-                        "Trying the next model."
-                    )
-                    errors.append(f"{model_name}: {message}")
-                    break
-
-                raise
+                errors.append(f"{model_name}: {detail}")
+                break
 
     raise RuntimeError(
-        "All available Gemini models failed. Errors: "
-        + " | ".join(errors)
+        "All available Gemini models failed. Errors: " + " | ".join(errors)
     )
 
 
 def get_pexels_image(query: str, video_type: str) -> Image.Image | None:
-    """Fetch one relevant background image from Pexels."""
     pexels_api_key = _clean_text(os.getenv("PEXELS_API_KEY", ""))
     if not pexels_api_key:
         print("â ï¸ PEXELS_API_KEY missing. Using a solid background.")
         return None
-
     orientation = "landscape" if video_type == "long" else "portrait"
     try:
         response = requests.get(
             "https://api.pexels.com/v1/search",
             headers={"Authorization": pexels_api_key},
-            params={
-                "query": f"abstract {query}",
-                "per_page": 1,
-                "orientation": orientation,
-            },
+            params={"query": f"abstract {query}", "per_page": 1, "orientation": orientation},
             timeout=20,
         )
         response.raise_for_status()
         photos = response.json().get("photos", [])
         if not photos:
             return None
-
         image_url = photos[0]["src"]["large2x"]
         image_response = requests.get(image_url, timeout=20)
         image_response.raise_for_status()
@@ -271,14 +234,11 @@ def get_pexels_image(query: str, video_type: str) -> Image.Image | None:
 
 
 def text_to_speech(text: str, output_path: Path) -> Path:
-    """Convert narration to WAV for reliable MoviePy audio."""
     print("ð¤ Converting script to speech...")
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     temp_mp3 = output_path.with_name(f"{output_path.stem}_temp.mp3")
     wav_path = output_path.with_suffix(".wav")
-
     try:
         gTTS(text=_clean_text(text), lang="en", slow=False).save(str(temp_mp3))
         audio = AudioSegment.from_mp3(str(temp_mp3))
@@ -291,18 +251,11 @@ def text_to_speech(text: str, output_path: Path) -> Path:
         raise
 
 
-def generate_curriculum(
-    previous_titles: list[str] | None = None,
-) -> dict[str, Any]:
-    """Generate the exact curriculum structure expected by main.py."""
+def generate_curriculum(previous_titles: list[str] | None = None) -> dict[str, Any]:
     print("ð¤ Generating curriculum...")
-
     history = ""
     if previous_titles:
-        formatted = "\n".join(
-            f"{index + 1}. {title}"
-            for index, title in enumerate(previous_titles)
-        )
+        formatted = "\n".join(f"{index + 1}. {title}" for index, title in enumerate(previous_titles))
         history = (
             "These lessons have already been created. Do not repeat them:\n"
             f"{formatted}\nContinue from where the series stopped.\n"
@@ -347,26 +300,21 @@ Rules:
         title = _clean_text(lesson.get("title", ""))
         if not title:
             continue
-        clean_lessons.append(
-            {
-                "chapter": _clean_text(lesson.get("chapter", index)),
-                "part": _clean_text(lesson.get("part", index)),
-                "title": title,
-                "status": "pending",
-                "youtube_id": None,
-            }
-        )
-
+        clean_lessons.append({
+            "chapter": _clean_text(lesson.get("chapter", index)),
+            "part": _clean_text(lesson.get("part", index)),
+            "title": title,
+            "status": "pending",
+            "youtube_id": None,
+        })
     if not clean_lessons:
         raise ValueError("Gemini returned no usable lessons.")
     return {"lessons": clean_lessons}
 
 
 def generate_lesson_content(lesson_title: str) -> dict[str, Any]:
-    """Generate long-form slides, a Short highlight, and hashtags."""
     lesson_title = _clean_text(lesson_title)
     print(f"ð¤ Generating content for lesson: '{lesson_title}'...")
-
     prompt = f"""
 Create a beginner-friendly YouTube lesson for
 "AI for Developers by {YOUR_NAME}".
@@ -394,7 +342,6 @@ Rules:
 - Do not include Markdown or explanations outside JSON.
 """
     result = _generate_json(prompt)
-
     slides = result.get("long_form_slides")
     if not isinstance(slides, list) or not slides:
         raise ValueError("Gemini returned no valid long_form_slides.")
@@ -407,18 +354,15 @@ Rules:
         content = _clean_text(slide.get("content", ""))
         if title and content:
             clean_slides.append({"title": title, "content": content})
-
     if not clean_slides:
         raise ValueError("Gemini returned no usable slides.")
 
     highlight = _clean_text(result.get("short_form_highlight", ""))
     hashtags = _clean_text(result.get("hashtags", ""))
-
     return {
         "long_form_slides": clean_slides,
         "short_form_highlight": highlight or f"Quick AI lesson: {lesson_title}",
-        "hashtags": hashtags
-        or "#AI #Developer #LearnAI #Programming #Technology",
+        "hashtags": hashtags or "#AI #Developer #LearnAI #Programming #Technology",
     }
 
 
@@ -429,16 +373,10 @@ def _font(size: int) -> ImageFont.ImageFont:
         return FALLBACK_THUMBNAIL_FONT
 
 
-def _wrap_text(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.ImageFont,
-    max_width: int,
-) -> list[str]:
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
     words = str(text).split()
     if not words:
         return [""]
-
     lines: list[str] = []
     current = ""
     for word in words:
@@ -462,24 +400,17 @@ def generate_visuals(
     slide_number: int = 0,
     total_slides: int = 0,
 ) -> str:
-    """Create one slide or thumbnail."""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
-
     is_thumbnail = thumbnail_title is not None
     width, height = (1920, 1080) if video_type == "long" else (1080, 1920)
     slide_content = slide_content or {}
-    title = _clean_text(
-        thumbnail_title if is_thumbnail else slide_content.get("title", "")
-    )
+    title = _clean_text(thumbnail_title if is_thumbnail else slide_content.get("title", ""))
 
     bg_image = get_pexels_image(title, video_type)
     if bg_image is None:
         bg_image = Image.new("RGBA", (width, height), color=(12, 17, 29))
-
-    bg_image = bg_image.resize((width, height)).filter(
-        ImageFilter.GaussianBlur(5)
-    )
+    bg_image = bg_image.resize((width, height)).filter(ImageFilter.GaussianBlur(5))
     darken = Image.new("RGBA", bg_image.size, (0, 0, 0, 150))
     final_bg = Image.alpha_composite(bg_image, darken).convert("RGB")
     draw = ImageDraw.Draw(final_bg)
@@ -495,83 +426,39 @@ def generate_visuals(
         for line in title_lines:
             box = draw.textbbox((0, 0), line, font=title_font)
             x = (width - (box[2] - box[0])) / 2
-            draw.text(
-                (x, start_y),
-                line,
-                font=title_font,
-                fill=(255, 255, 255),
-                stroke_width=2,
-                stroke_fill="black",
-            )
+            draw.text((x, start_y), line, font=title_font, fill=(255, 255, 255), stroke_width=2, stroke_fill="black")
             start_y += line_height
     else:
         header_height = int(height * 0.18)
-        draw.rectangle(
-            (0, 0, width, header_height),
-            fill=(25, 40, 65, 200),
-        )
-
+        draw.rectangle((0, 0, width, header_height), fill=(25, 40, 65, 200))
         title_lines = _wrap_text(draw, title, title_font, int(width * 0.9))
         title_line_height = max(title_font.getbbox("Ag")[3] + 10, 30)
-        title_y = (
-            header_height - len(title_lines) * title_line_height
-        ) / 2
+        title_y = (header_height - len(title_lines) * title_line_height) / 2
         for line in title_lines:
             box = draw.textbbox((0, 0), line, font=title_font)
             x = (width - (box[2] - box[0])) / 2
-            draw.text(
-                (x, title_y),
-                line,
-                font=title_font,
-                fill=(255, 255, 255),
-            )
+            draw.text((x, title_y), line, font=title_font, fill=(255, 255, 255))
             title_y += title_line_height
 
         content = _clean_text(slide_content.get("content", ""))
-        content_lines = _wrap_text(
-            draw,
-            content,
-            content_font,
-            int(width * 0.82),
-        )
+        content_lines = _wrap_text(draw, content, content_font, int(width * 0.82))
         content_line_height = max(content_font.getbbox("Ag")[3] + 15, 25)
         content_y = header_height + 100
         if len(content.split()) < 10:
-            content_y = (
-                height - len(content_lines) * content_line_height
-            ) / 2
-
+            content_y = (height - len(content_lines) * content_line_height) / 2
         for line in content_lines:
             box = draw.textbbox((0, 0), line, font=content_font)
             x = (width - (box[2] - box[0])) / 2
-            draw.text(
-                (x, content_y),
-                line,
-                font=content_font,
-                fill=(230, 230, 230),
-            )
+            draw.text((x, content_y), line, font=content_font, fill=(230, 230, 230))
             content_y += content_line_height
 
         footer_height = int(height * 0.06)
-        draw.rectangle(
-            (0, height - footer_height, width, height),
-            fill=(25, 40, 65, 200),
-        )
-        draw.text(
-            (40, height - footer_height + 12),
-            f"AI for Developers by {YOUR_NAME}",
-            font=footer_font,
-            fill=(180, 180, 180),
-        )
+        draw.rectangle((0, height - footer_height, width, height), fill=(25, 40, 65, 200))
+        draw.text((40, height - footer_height + 12), f"AI for Developers by {YOUR_NAME}", font=footer_font, fill=(180, 180, 180))
         if total_slides:
             slide_text = f"Slide {slide_number} of {total_slides}"
             box = draw.textbbox((0, 0), slide_text, font=footer_font)
-            draw.text(
-                (width - (box[2] - box[0]) - 40, height - footer_height + 12),
-                slide_text,
-                font=footer_font,
-                fill=(180, 180, 180),
-            )
+            draw.text((width - (box[2] - box[0]) - 40, height - footer_height + 12), slide_text, font=footer_font, fill=(180, 180, 180))
 
     prefix = "thumbnail" if is_thumbnail else f"slide_{slide_number:02d}"
     path = output_dir / f"{prefix}.png"
@@ -579,13 +466,7 @@ def generate_visuals(
     return str(path)
 
 
-def create_video(
-    slide_paths: list[str],
-    audio_paths: list[Path],
-    output_path: Path,
-    video_type: str,
-) -> None:
-    """Create final video from slides and synchronized narration."""
+def create_video(slide_paths: list[str], audio_paths: list[Path], output_path: Path, video_type: str) -> None:
     print(f"ð¬ Creating {video_type} video...")
     if not slide_paths or len(slide_paths) != len(audio_paths):
         raise ValueError("Slides and audio counts do not match.")
@@ -594,7 +475,6 @@ def create_video(
     opened_audio = []
     bg_music = None
     final_video = None
-
     try:
         for image_path, audio_path in zip(slide_paths, audio_paths):
             audio_clip = AudioFileClip(str(audio_path))
@@ -610,7 +490,6 @@ def create_video(
             image_clips.append(clip)
 
         final_video = concatenate_videoclips(image_clips, method="compose")
-
         if BACKGROUND_MUSIC_PATH.exists():
             print("ðµ Adding background music...")
             bg_music = AudioFileClip(str(BACKGROUND_MUSIC_PATH)).volumex(0.05)
@@ -618,23 +497,15 @@ def create_video(
                 bg_music = bg_music.fx(vfx.loop, duration=final_video.duration)
             else:
                 bg_music = bg_music.subclip(0, final_video.duration)
-
             final_video = final_video.set_audio(
-                CompositeAudioClip(
-                    [final_video.audio.volumex(1.2), bg_music]
-                )
+                CompositeAudioClip([final_video.audio.volumex(1.2), bg_music])
             )
 
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         final_video.write_videofile(
-            str(output_path),
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            audio_bitrate="192k",
-            preset="medium",
-            threads=4,
+            str(output_path), fps=24, codec="libx264", audio_codec="aac",
+            audio_bitrate="192k", preset="medium", threads=4,
         )
         print(f"â {video_type.capitalize()} video created successfully!")
     finally:
